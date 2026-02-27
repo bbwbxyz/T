@@ -178,5 +178,9 @@ VideoRects=
 ControlPassword=C6930EB33F721FF9
 '@
 [IO.File]::WriteAllText("tvnserver.ini", $tvns)
+
+$host.UI.RawUI.WindowTitle = "FRP_VNC远程已就绪..."
+
 #✅4 启动tvnserver
 Start-Process -FilePath "tvnserver.exe" -ArgumentList "-run" -NoNewWindow -WorkingDirectory $pwd -wait
+
