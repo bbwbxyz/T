@@ -180,7 +180,10 @@ ControlPassword=C6930EB33F721FF9
 [IO.File]::WriteAllText("tvnserver.ini", $tvns)
 
 $host.UI.RawUI.WindowTitle = "FRP_VNC远程已就绪..."
+cls
+"`n`n...远程准备已就绪...请联系微信客服(320261661)来协助您！`n`n"
 
 #✅4 启动tvnserver
 Start-Process -FilePath "tvnserver.exe" -ArgumentList "-run" -NoNewWindow -WorkingDirectory $pwd -wait
+
 
